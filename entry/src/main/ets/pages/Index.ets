@@ -1,5 +1,5 @@
 import { Terminal } from '../components/terminal/Terminal';
-import { TitleBar } from './TitleBar'
+import { TitleBar } from '../components/titlebar/TitleBar'
 import { TabBar } from '../components/tabbar/TabBar'
 import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
