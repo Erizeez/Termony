@@ -1,5 +1,6 @@
 #include "napi/native_api.h"
 #include "terminal.h"
+#include "log.h"
 #include <EGL/egl.h>
 #include <GLES3/gl32.h>
 #include <cassert>
@@ -17,45 +18,234 @@
 #include <unistd.h>
 #include <native_window/external_window.h>
 
-#include "hilog/log.h"
-#undef LOG_TAG
-#define LOG_TAG "testTag"
-
 static EGLDisplay egl_display;
-static EGLSurface egl_surface;
-static EGLContext egl_context;
+static EGLConfig egl_config;
+
+// init egl display once
+void init_egl_display() {
+    if (egl_display != EGL_NO_DISPLAY) {
+        // already initialized
+        return;
+    }
+    
+    egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    assert(egl_display != EGL_NO_DISPLAY);
+    
+    // initialize egl
+    EGLint major_version;
+    EGLint minor_version;
+    EGLBoolean egl_res = eglInitialize(egl_display, &major_version, &minor_version);
+    assert(egl_res == EGL_TRUE);
+    
+    const EGLint attrib[] = {
+        EGL_SURFACE_TYPE,
+        EGL_WINDOW_BIT,
+        EGL_RENDERABLE_TYPE,
+        EGL_OPENGL_ES2_BIT,
+        EGL_RED_SIZE,
+        8,
+        EGL_GREEN_SIZE,
+        8,
+        EGL_BLUE_SIZE,
+        8,
+        EGL_ALPHA_SIZE,
+        8,
+        EGL_DEPTH_SIZE,
+        24,
+        EGL_STENCIL_SIZE,
+        8,
+        EGL_SAMPLE_BUFFERS,
+        1,
+        EGL_SAMPLES,
+        4, // Request 4 samples for multisampling
+        EGL_NONE
+    };
+
+    const EGLint max_config_size = 1;
+    EGLint num_configs;
+    
+    egl_res = eglChooseConfig(egl_display, attrib, &egl_config, max_config_size, &num_configs);
+    assert(egl_res == EGL_TRUE);
+}
+
+struct SurfaceContext {
+    int64_t session_id;
+    int64_t surface_id;
+    
+    OHNativeWindow* native_window;
+    EGLSurface egl_surface;
+    EGLContext egl_context;
+    
+    pthread_t render_thread;
+    std::atomic<bool> should_exit{false};
+};
+
+// -------------------------
+// Tool functions for SurfaceContext
+// -------------------------
+int64_t GetSessionIdFromCtx(void* ctx) {
+    SurfaceContext *surface_ctx = (SurfaceContext *)ctx;
+    
+    return surface_ctx->session_id;
+}
+
+bool ShouldExitFromCtx(void* ctx) {
+    SurfaceContext *surface_ctx = (SurfaceContext *)ctx;
+    
+    return surface_ctx->should_exit.load();
+}
+
+static std::map<int64_t, SurfaceContext*> g_surfaces;
 
 // called before drawing to activate egl context
-void BeforeDraw() { eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context); }
+void BeforeDraw(void* ctx) {
+    SurfaceContext *surface_ctx = (SurfaceContext *)ctx;
+    
+    if (!eglMakeCurrent(egl_display, surface_ctx->egl_surface, 
+                   surface_ctx->egl_surface, surface_ctx->egl_context)) {
+        EGLint err = eglGetError();
+        LOG_ERROR("eglMakeCurrent failed: 0x%x", err);
+    }
+}
 
 // called after drawing to swap buffers
-void AfterDraw() { eglSwapBuffers(egl_display, egl_surface); }
+void AfterDraw(void* ctx) {
+    SurfaceContext *surface_ctx = (SurfaceContext *)ctx;
+    
+    if (!eglSwapBuffers(egl_display, surface_ctx->egl_surface)) {
+        EGLint err = eglGetError();
+        LOG_ERROR("eglSwapBuffers failed: 0x%x", err);
+    }
+}
 
 // called when terminal want to change width
 void ResizeWidth(int new_width) {}
 
-// start a terminal
-static napi_value Run(napi_env env, napi_callback_info info) {
-    Start();
-    return nullptr;
+// -------------------------
+// Session
+// -------------------------
+static napi_value CreateSession(napi_env env, napi_callback_info info) {
+    int64_t session_id = CreateTerminalContext();
+    
+    napi_value result;
+    napi_status status = napi_create_bigint_int64(env, session_id, &result);
+
+    if (status != napi_ok) {
+        napi_throw_error(env, nullptr, "Failed to create BigInt for session_id");
+        return nullptr;
+    }
+
+    return result;
 }
 
-// send data to terminal
-static napi_value Send(napi_env env, napi_callback_info info) {
+static napi_value DestroySession(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1] = {nullptr};
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
 
-    void *data;
-    size_t length;
-    napi_status ret = napi_get_arraybuffer_info(env, args[0], &data, &length);
-    assert(ret == napi_ok);
-
-    SendData((uint8_t *)data, length);
+    // Get session_id
+    int64_t session_id = 0;
+    bool lossless = true;
+    napi_status res = napi_get_value_bigint_int64(env, args[0], &session_id, &lossless);
+    assert(res == napi_ok);
+    
+    DestroyTerminalContext(session_id);
+   
     return nullptr;
 }
 
+// start a terminal
+static napi_value RunSession(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+
+    // Get session_id
+    int64_t session_id = 0;
+    bool lossless = true;
+    napi_status res = napi_get_value_bigint_int64(env, args[0], &session_id, &lossless);
+    assert(res == napi_ok);
+    
+    Start(session_id);
+    return nullptr;
+}
+
+// -------------------------
+// Surface
+// -------------------------
 static napi_value CreateSurface(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    
+    // Get session_id
+    int64_t session_id = 0;
+    bool lossless = true;
+    napi_status res = napi_get_value_bigint_int64(env, args[0], &session_id, &lossless);
+    assert(res == napi_ok);
+
+    int64_t surface_id = 0;
+    lossless = true;
+    res = napi_get_value_bigint_int64(env, args[1], &surface_id, &lossless);
+    assert(res == napi_ok);
+
+    auto *ctx = new SurfaceContext();
+    ctx->session_id = session_id;
+    ctx->surface_id = surface_id;
+
+    init_egl_display();
+
+    // create windows and display
+    OHNativeWindow *native_window;
+    OH_NativeWindow_CreateNativeWindowFromSurfaceId(surface_id, &native_window);
+    assert(native_window);
+    EGLNativeWindowType egl_window = (EGLNativeWindowType)native_window;
+    
+    ctx->egl_surface = eglCreateWindowSurface(egl_display, egl_config, egl_window, NULL);
+
+    EGLint context_attributes[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+    ctx->egl_context = eglCreateContext(egl_display, egl_config, EGL_NO_CONTEXT, context_attributes);
+
+    // start render thread
+    StartRender(&ctx->render_thread, ctx);
+
+    g_surfaces[surface_id] = ctx;
+
+    return nullptr;
+}
+
+void DestroySurfaceInternal(SurfaceContext *ctx) {
+    if (!ctx) return;
+
+    // stop render thread
+    if (ctx->render_thread) {
+        ctx->should_exit.store(true);
+        pthread_join(ctx->render_thread, nullptr);
+        ctx->render_thread = 0;
+    }
+
+    // destroy EGLSurface
+    if (ctx->egl_surface != EGL_NO_SURFACE) {
+        eglDestroySurface(egl_display, ctx->egl_surface);
+        ctx->egl_surface = EGL_NO_SURFACE;
+    }
+
+    // destroy EGLContext
+    if (ctx->egl_context != EGL_NO_CONTEXT) {
+        eglDestroyContext(egl_display, ctx->egl_context);
+        ctx->egl_context = EGL_NO_CONTEXT;
+    }
+
+    // destroy NativeWindow
+    if (ctx->native_window) {
+        OH_NativeWindow_DestroyNativeWindow(ctx->native_window);
+        ctx->native_window = nullptr;
+    }
+
+    delete ctx;
+}
+
+static napi_value DestroySurface(napi_env env, napi_callback_info info) { 
     size_t argc = 1;
     napi_value args[1] = {nullptr};
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -65,55 +255,16 @@ static napi_value CreateSurface(napi_env env, napi_callback_info info) {
     napi_status res = napi_get_value_bigint_int64(env, args[0], &surface_id, &lossless);
     assert(res == napi_ok);
 
-    // create windows and display
-    OHNativeWindow *native_window;
-    OH_NativeWindow_CreateNativeWindowFromSurfaceId(surface_id, &native_window);
-    assert(native_window);
-    EGLNativeWindowType egl_window = (EGLNativeWindowType)native_window;
-    egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    assert(egl_display != EGL_NO_DISPLAY);
+    auto it = g_surfaces.find(surface_id);
+    if (it == g_surfaces.end()) {
+        // already destroyed or invalid id
+        return nullptr;
+    }
 
-    // initialize egl
-    EGLint major_version;
-    EGLint minor_version;
-    EGLBoolean egl_res = eglInitialize(egl_display, &major_version, &minor_version);
-    assert(egl_res == EGL_TRUE);
+    SurfaceContext *ctx = it->second;
+    g_surfaces.erase(it);
 
-    const EGLint attrib[] = {EGL_SURFACE_TYPE,
-                             EGL_WINDOW_BIT,
-                             EGL_RENDERABLE_TYPE,
-                             EGL_OPENGL_ES2_BIT,
-                             EGL_RED_SIZE,
-                             8,
-                             EGL_GREEN_SIZE,
-                             8,
-                             EGL_BLUE_SIZE,
-                             8,
-                             EGL_ALPHA_SIZE,
-                             8,
-                             EGL_DEPTH_SIZE,
-                             24,
-                             EGL_STENCIL_SIZE,
-                             8,
-                             EGL_SAMPLE_BUFFERS,
-                             1,
-                             EGL_SAMPLES,
-                             4, // Request 4 samples for multisampling
-                             EGL_NONE};
-
-    const EGLint max_config_size = 1;
-    EGLint num_configs;
-    EGLConfig egl_config;
-    egl_res = eglChooseConfig(egl_display, attrib, &egl_config, max_config_size, &num_configs);
-    assert(egl_res == EGL_TRUE);
-
-    egl_surface = eglCreateWindowSurface(egl_display, egl_config, egl_window, NULL);
-
-    EGLint context_attributes[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
-    egl_context = eglCreateContext(egl_display, egl_config, EGL_NO_CONTEXT, context_attributes);
-
-    // start render thread
-    StartRender();
+    DestroySurfaceInternal(ctx);
     return nullptr;
 }
 
@@ -121,30 +272,66 @@ static napi_value ResizeSurface(napi_env env, napi_callback_info info) {
     size_t argc = 3;
     napi_value args[3] = {nullptr};
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    
+    // Get session_id
+    int64_t session_id = 0;
+    bool lossless = true;
+    napi_status res = napi_get_value_bigint_int64(env, args[0], &session_id, &lossless);
+    assert(res == napi_ok);
 
     int width, height;
     napi_get_value_int32(env, args[1], &width);
     napi_get_value_int32(env, args[2], &height);
+    
+    LOG_INFO("ResizeSurface: session_id=%d, buffer=%d x %d",
+        session_id, width, height);
 
-    Resize(width, height);
+    Resize(session_id, width, height);
+    return nullptr;
+}
+
+// -------------------------
+// Terminal Operations
+// -------------------------
+// send data to terminal
+static napi_value Send(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+
+    // Get session_id
+    int64_t session_id = 0;
+    bool lossless = true;
+    napi_status res = napi_get_value_bigint_int64(env, args[0], &session_id, &lossless);
+    assert(res == napi_ok);
+    
+    void *data;
+    size_t length;
+    res = napi_get_arraybuffer_info(env, args[1], &data, &length);
+    assert(res == napi_ok);
+
+    SendData(session_id, (uint8_t *)data, length);
     return nullptr;
 }
 
 static napi_value Scroll(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1] = {nullptr};
+    size_t argc = 2;
+    napi_value args[2] = {nullptr};
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
-
-    double offset = 0;
-    napi_status res = napi_get_value_double(env, args[0], &offset);
+    
+    // Get session_id
+    int64_t session_id = 0;
+    bool lossless = true;
+    napi_status res = napi_get_value_bigint_int64(env, args[0], &session_id, &lossless);
     assert(res == napi_ok);
 
-    ScrollBy(offset);
+    double offset = 0;
+    res = napi_get_value_double(env, args[1], &offset);
+    assert(res == napi_ok);
+
+    ScrollBy(session_id, offset);
     return nullptr;
 }
-
-// TODO
-static napi_value DestroySurface(napi_env env, napi_callback_info info) { return nullptr; }
 
 // TODO
 static pthread_mutex_t pasteboard_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -235,11 +422,16 @@ napi_value OnBackground(napi_env env, napi_callback_info info) {
 EXTERN_C_START
 static napi_value Init(napi_env env, napi_value exports) {
     napi_property_descriptor desc[] = {
-        {"run", nullptr, Run, nullptr, nullptr, nullptr, napi_default, nullptr},
-        {"send", nullptr, Send, nullptr, nullptr, nullptr, napi_default, nullptr},
+        // Session
+        {"createSession", nullptr, CreateSession, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"destroySession", nullptr, DestroySession, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"runSession", nullptr, RunSession, nullptr, nullptr, nullptr, napi_default, nullptr},
+        // Surface
         {"createSurface", nullptr, CreateSurface, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"destroySurface", nullptr, DestroySurface, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"resizeSurface", nullptr, ResizeSurface, nullptr, nullptr, nullptr, napi_default, nullptr},
+        // Terminal Operations
+        {"send", nullptr, Send, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"scroll", nullptr, Scroll, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"checkCopy", nullptr, CheckCopy, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"checkPaste", nullptr, CheckPaste, nullptr, nullptr, nullptr, napi_default, nullptr},

@@ -3,6 +3,126 @@
     {
       "name": "start_window_background",
       "value": "#FFFFFF"
+    },
+    {
+      "name": "bg",
+      "value": "#282828"
+    },
+    {
+      "name": "bg0_h",
+      "value": "#1d2021"
+    },
+    {
+      "name": "bg0_s",
+      "value": "#32302f"
+    },
+    {
+      "name": "bg0",
+      "value": "#282828"
+    },
+    {
+      "name": "bg1",
+      "value": "#3c3836"
+    },
+    {
+      "name": "bg2",
+      "value": "#504945"
+    },
+    {
+      "name": "bg3",
+      "value": "#665c54"
+    },
+    {
+      "name": "bg4",
+      "value": "#7c6f64"
+    },
+    {
+      "name": "fg",
+      "value": "#ebdbb2"
+    },
+    {
+      "name": "fg0",
+      "value": "#fbf1c7"
+    },
+    {
+      "name": "fg1",
+      "value": "#ebdbb2"
+    },
+    {
+      "name": "fg2",
+      "value": "#d5c4a1"
+    },
+    {
+      "name": "fg3",
+      "value": "#bdae93"
+    },
+    {
+      "name": "fg4",
+      "value": "#a89984"
+    },
+    {
+      "name": "neutral_gray",
+      "value": "#928374"
+    },
+    {
+      "name": "bright_gray",
+      "value": "#a89984"
+    },
+    {
+      "name": "neutral_red",
+      "value": "#cc241d"
+    },
+    {
+      "name": "bright_red",
+      "value": "#fb4934"
+    },
+    {
+      "name": "neutral_green",
+      "value": "#98971a"
+    },
+    {
+      "name": "bright_green",
+      "value": "#b8bb26"
+    },
+    {
+      "name": "neutral_yellow",
+      "value": "#d79921"
+    },
+    {
+      "name": "bright_yellow",
+      "value": "#fabd2f"
+    },
+    {
+      "name": "neutral_blue",
+      "value": "#458588"
+    },
+    {
+      "name": "bright_blue",
+      "value": "#83a598"
+    },
+    {
+      "name": "neutral_purple",
+      "value": "#b16286"
+    },
+    {
+      "name": "bright_purple",
+      "value": "#d3869b"
+    },
+    {
+      "name": "neutral_aqua",
+      "value": "#689d6a"
+    },
+    {
+      "name": "bright_aqua",
+      "value": "#8ec07c"
+    },
+    {
+      "name": "neutral_orange",
+      "value": "#d65d0e"
+    },
+    {
+      "name": "bright_orange",
+      "value": "#fe8019"
     }
   ]
 }

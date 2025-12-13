@@ -9,7 +9,6 @@
 #include <optional>
 #include <pthread.h>
 
-
 // font weight, italic
 enum font_class {
     regular = 0,
@@ -109,6 +108,8 @@ enum utf8_states {
 };
 
 struct terminal_context {
+    int64_t session_id;
+    
     // protect multithreaded usage
     pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -161,6 +162,13 @@ struct terminal_context {
     // DECSTBM, scrolling region
     int scroll_top = 0;
     int scroll_bottom = num_rows - 1;
+    
+    int buffer_width = 0;
+    int buffer_height = 0;
+    
+    pthread_t terminal_thread;
+    std::atomic<bool> should_exit{false};
+    std::atomic<bool> is_rendering{false};
 
     void ResizeTo(int new_term_row, int new_term_col);
 
@@ -196,24 +204,31 @@ struct terminal_context {
     void Fork();
 };
 
+// create a new terminal context
+int64_t CreateTerminalContext();
+// destroy existing terminal context
+void DestroyTerminalContext(int64_t session_id);
 // start a terminal
-void Start();
+void Start(int64_t session_id);
 // start rendering
-void StartRender();
+void StartRender(pthread_t *render_thread, void* ctx);
 // send data to terminal
-void SendData(uint8_t *data, size_t length);
+void SendData(int64_t session_id, uint8_t *data, size_t length);
 // resize window
-void Resize(int width, int height);
-void ScrollBy(double offset);
+void Resize(int64_t session_id, int width, int height);
+void ScrollBy(int64_t session_id, double offset);
 
 // implemented by code in napi/glfw
-extern void BeforeDraw();
-extern void AfterDraw();
+extern void BeforeDraw(void* ctx);
+extern void AfterDraw(void* ctx);
 extern void ResizeWidth(int new_width);
 // copy/paste with base64 encoded string
 extern void Copy(std::string base64);
 extern void RequestPaste();
 extern std::string GetPaste();
+
+extern int64_t GetSessionIdFromCtx(void* ctx);
+extern bool ShouldExitFromCtx(void* ctx);
 
 // huge it is intentionally kept here
 static constexpr uint32_t color_map_256[] = {

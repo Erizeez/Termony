@@ -2,12 +2,12 @@
 // clang++ -std=c++17 terminal.cpp -I/usr/include/freetype2 -DSTANDALONE -lfreetype -lutf8proc -lGLESv2 -lglfw -o terminal
 
 #include "terminal.h"
+#include "log.h"
 #include "freetype/ftmm.h"
 #include "utf8proc/utf8proc.h"
 #include <GLES3/gl32.h>
 #include <algorithm>
 #include <cassert>
-#include <cstdarg>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -23,36 +23,6 @@
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
-
-#ifdef STANDALONE
-#define LOG_INFO(fmt, ...) fprintf(stderr, fmt "\n", __VA_ARGS__)
-#define LOG_WARN(fmt, ...) fprintf(stderr, fmt "\n", __VA_ARGS__)
-#define LOG_ERROR(fmt, ...) fprintf(stderr, fmt "\n", __VA_ARGS__)
-#else
-#include "hilog/log.h"
-#undef LOG_DEBUG
-#undef LOG_INFO
-#undef LOG_WARN
-#undef LOG_ERROR
-#undef LOG_FATAL
-void hiprintf(int level, const char * fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    constexpr int bufsz = 8192;
-    char buf[bufsz];
-    if (vsnprintf(buf, bufsz, fmt, args) > 0) {
-        OH_LOG_Print(LOG_APP, (LogLevel)level, 0, "testTag", "%{public}s", buf);
-    }
-    va_end(args);
-}
-// supress logs
-//#define hiprintf(...)
-#define LOG_DEBUG(...) hiprintf(3, __VA_ARGS__)
-#define LOG_INFO(...) hiprintf(4, __VA_ARGS__)
-#define LOG_WARN(...) hiprintf(5, __VA_ARGS__)
-#define LOG_ERROR(...) hiprintf(6, __VA_ARGS__)
-#define LOG_FATAL(...) hiprintf(7, __VA_ARGS__)
-#endif
 
 // docs for escape codes:
 // https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
@@ -106,8 +76,7 @@ static std::vector<std::string> SplitString(const std::string &str, const std::s
 }
 
 // viewport width/height = [font_width, font_height] . [num_cols, num_rows]
-static int buffer_width = 0;
-static int buffer_height = 0;
+
 static int
 #ifdef STANDALONE
 
@@ -1164,7 +1133,7 @@ void terminal_context::Worker() {
     int temp = 0;
     // poll from fd, and render
     struct timeval tv;
-    while (1) {
+    while (!should_exit.load()) {
         struct pollfd fds[1];
         fds[0].fd = fd;
         fds[0].events = POLLIN;
@@ -1244,6 +1213,10 @@ void terminal_context::Fork() {
     ws.ws_row = num_rows;
 
     int pid = forkpty(&fd, nullptr, nullptr, &ws);
+    if (pid < 0) {
+        LOG_ERROR("forkpty failed: errno=%d (%s)\n", errno, strerror(errno));
+        return;
+    }
     if (!pid) {
 #ifdef STANDALONE
         execl("/bin/bash", "/bin/bash", nullptr);
@@ -1267,14 +1240,32 @@ void terminal_context::Fork() {
 
     // set as non blocking
     int res = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    if (res != 0) {
+        LOG_ERROR("forkpty res = %d, errno=%d (%s)\n", res, errno, strerror(errno));
+    }
     assert(res == 0);
 
     // start terminal worker in another thread
-    pthread_t terminal_thread;
     pthread_create(&terminal_thread, NULL, TerminalWorker, this);
 }
 
-static terminal_context term;
+static std::atomic<int64_t> g_nextSessionId{1};
+
+int64_t GenerateSessionId() {
+    return g_nextSessionId.fetch_add(1);
+}
+
+static std::map<int64_t, terminal_context*> g_contexts;
+
+terminal_context* GetTerminalContext(int64_t sessionId) {
+    auto it = g_contexts.find(sessionId);
+    if (it == g_contexts.end()) {
+        return nullptr;
+    }
+    terminal_context* term = it->second;
+
+    return term;
+}
 
 // glyph info
 struct character {
@@ -1303,39 +1294,99 @@ static GLuint atlas_texture_id;
 // there is a limit on how big a texture can be
 static int atlas_width = 8192;
 
-static void ResizeTo(int new_term_row, int new_term_col, bool update_viewport = true) {
+static void ResizeTo(terminal_context* term, int new_term_row, int new_term_col, bool update_viewport = true) {
     // update viewport
     if (update_viewport) {
-        buffer_width = new_term_col * font_width;
-        buffer_height = new_term_row * font_height;
+        term->buffer_width = new_term_col * font_width;
+        term->buffer_height = new_term_row * font_height;
     }
 
-    term.ResizeTo(new_term_row, new_term_col);
+    term->ResizeTo(new_term_row, new_term_col);
 }
 
-void Start() {
-    pthread_mutex_lock(&term.lock);
-    if (term.fd != -1) {
+int64_t CreateTerminalContext() {
+    int64_t session_id = GenerateSessionId();
+
+    terminal_context* s = new terminal_context();
+    s->session_id = session_id;
+
+    g_contexts[session_id] = s;
+    
+    return session_id;
+}
+
+void DestroyTerminalContext(int64_t session_id) {
+    auto it = g_contexts.find(session_id);
+    if (it == g_contexts.end()) {
+        return;
+    }
+
+    terminal_context* term = it->second;
+
+    if (term == nullptr) {
+        return;
+    }
+
+    // ask shell to exit gracefully
+    if (term->fd >= 0) {
+        const char *cmd = "exit\n";
+        write(term->fd, cmd, strlen(cmd));
+    }
+
+    // stop terminal thread
+    if (term->terminal_thread) {
+        term->should_exit.store(true);
+        pthread_join(term->terminal_thread, nullptr);
+        term->terminal_thread = 0;
+    }
+
+    // close pty master
+    if (term->fd >= 0) {
+        close(term->fd);
+        term->fd = -1;
+    }
+
+    while (term->is_rendering.load()) {
+        sched_yield();
+    }
+
+    delete term;
+    g_contexts.erase(it);
+}
+
+void Start(int64_t session_id) {
+    terminal_context* term = GetTerminalContext(session_id);
+    if (term == nullptr) {
+        return;
+    }
+
+    pthread_mutex_lock(&term->lock);
+    if (term->fd != -1) {
         return;
     }
 
     // setup terminal, default to 80x24
-    term.ResizeTo(24, 80);
+    term->ResizeTo(24, 80);
 
-    term.Fork();
+    term->Fork();
 
-    pthread_mutex_unlock(&term.lock);
+    pthread_mutex_unlock(&term->lock);
 }
 
-void SendData(uint8_t *data, size_t length) {
-    if (term.fd == -1) {
+void SendData(int64_t session_id, uint8_t *data, size_t length) {
+    terminal_context* term = GetTerminalContext(session_id);
+    if (term == nullptr) {
+        return;
+    }
+
+    if (term->fd == -1) {
         return;
     }
 
     // reset scroll offset to bottom
     scroll_offset = 0.0;
 
-    term.WriteFull(data, length);
+    term->WriteFull(data, length);
 }
 
 // build font texture
@@ -1514,7 +1565,7 @@ static GLuint text_color_buffer;
 // vec3 backGroundColor
 static GLuint background_color_buffer;
 
-static void Draw() {
+static int Draw(void* ctx, terminal_context* term) {
     // blink every 0.5s
     struct timeval tv;
     gettimeofday(&tv, nullptr);
@@ -1528,11 +1579,18 @@ static void Draw() {
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     // update surface size
-    pthread_mutex_lock(&term.lock);
-    int aligned_width = buffer_width / font_width * font_width;
-    int aligned_height = buffer_height / font_height * font_height;
+    pthread_mutex_lock(&term->lock);
+
+    if (term->should_exit.load()) {
+        pthread_mutex_unlock(&term->lock);
+        term->is_rendering.store(false);
+        return -1;
+    }
+
+    int aligned_width = term->buffer_width / font_width * font_width;
+    int aligned_height = term->buffer_height / font_height * font_height;
     glUniform2f(surface_location, aligned_width, aligned_height);
-    glViewport(0, buffer_height - aligned_height, aligned_width, aligned_height);
+    glViewport(0, term->buffer_height - aligned_height, aligned_width, aligned_height);
 
     // set texture
     glActiveTexture(GL_TEXTURE0);
@@ -1541,7 +1599,7 @@ static void Draw() {
     // bind our vertex array
     glBindVertexArray(vertex_array);
 
-    int max_lines = buffer_height / font_height;
+    int max_lines = term->buffer_height / font_height;
     // vec4 vertex
     static std::vector<GLfloat> vertex_pass0_data;
     static std::vector<GLfloat> vertex_pass1_data;
@@ -1550,19 +1608,24 @@ static void Draw() {
     // vec3 backgroundColor
     static std::vector<GLfloat> background_color_data;
 
+    LOG_INFO("Draw: buffer=%d x %d, aligned=%d x %d, max_lines=%d, term_rows=%d term_cols=%d",
+         term->buffer_width, term->buffer_height,
+         aligned_width, aligned_height,
+         max_lines, term->num_rows, term->num_cols);
+
     vertex_pass0_data.clear();
-    vertex_pass0_data.reserve(term.num_rows * term.num_cols * 24);
+    vertex_pass0_data.reserve(term->num_rows * term->num_cols * 24);
     vertex_pass1_data.clear();
-    vertex_pass1_data.reserve(term.num_rows * term.num_cols * 24);
+    vertex_pass1_data.reserve(term->num_rows * term->num_cols * 24);
     text_color_data.clear();
-    text_color_data.reserve(term.num_rows * term.num_cols * 18);
+    text_color_data.reserve(term->num_rows * term->num_cols * 18);
     background_color_data.clear();
-    background_color_data.reserve(term.num_rows * term.num_cols * 18);
+    background_color_data.reserve(term->num_rows * term->num_cols * 18);
 
     // ensure at least one line shown, for very large scroll_offset
     int scroll_rows = scroll_offset / font_height;
-    if ((int)term.history.size() + max_lines - 1 - scroll_rows < 0) {
-        scroll_offset = ((int)term.history.size() + max_lines - 1) * font_height;
+    if ((int)term->history.size() + max_lines - 1 - scroll_rows < 0) {
+        scroll_offset = ((int)term->history.size() + max_lines - 1) * font_height;
         scroll_rows = scroll_offset / font_height;
     }
 
@@ -1572,10 +1635,10 @@ static void Draw() {
         float y = aligned_height - (i + 1) * font_height;
         int i_row = i - scroll_rows;
         std::vector<term_char> row;
-        if (i_row >= 0 && i_row < term.num_rows) {
-            row = term.buffer[i_row];
-        } else if (i_row < 0 && (int)term.history.size() + i_row >= 0) {
-            row = term.history[term.history.size() + i_row];
+        if (i_row >= 0 && i_row < term->num_rows) {
+            row = term->buffer[i_row];
+        } else if (i_row < 0 && (int)term->history.size() + i_row >= 0) {
+            row = term->history[term->history.size() + i_row];
         } else {
             continue;
         }
@@ -1641,9 +1704,9 @@ static void Draw() {
                 c.style.back.put_f3(&g_background_color_buffer_data[i*3]);
             }
 
-            if (term.reverse_video ^
-(term.show_cursor && i_row == term.row &&
-(cur_col == term.col || (codepoint == term_char::WIDE_TAIL && cur_col == term.col+1)))) {
+            if (term->reverse_video ^
+(term->show_cursor && i_row == term->row &&
+(cur_col == term->col || (codepoint == term_char::WIDE_TAIL && cur_col == term->col+1)))) {
                 // invert text and bg colors
                 for (int i = 0; i < 18; i++) {
                     g_text_color_buffer_data[i] = 1.0 - g_text_color_buffer_data[i];
@@ -1666,7 +1729,7 @@ static void Draw() {
             cur_col++;
         }
     }
-    pthread_mutex_unlock(&term.lock);
+    pthread_mutex_unlock(&term->lock);
 
     // draw in two pass
     glBindBuffer(GL_ARRAY_BUFFER, text_color_buffer);
@@ -1691,14 +1754,25 @@ static void Draw() {
     glBindTexture(GL_TEXTURE_2D, 0);
     glFlush();
     glFinish();
-    AfterDraw();
+    AfterDraw(ctx);
+
+    return 0;
 }
 
 
-static void *RenderWorker(void *) {
+static void *RenderWorker(void* ctx) {
     pthread_setname_np(pthread_self(), "render worker");
 
-    BeforeDraw();
+    BeforeDraw(ctx);
+
+    int64_t session_id = GetSessionIdFromCtx(ctx);
+    terminal_context* term = GetTerminalContext(session_id);
+    if (term == nullptr) {
+        // terminal may be destroyed in advance
+        LOG_ERROR("RenderWorker: Failed to Get Terminal Context for session: %d", session_id);
+        return nullptr;
+    }
+    term->is_rendering.store(true);
 
     // build vertex and fragment shader
     GLuint vertex_shader_id = glCreateShader(GL_VERTEX_SHADER);
@@ -1849,10 +1923,10 @@ void main() {
     gettimeofday(&tv, nullptr);
     uint64_t last_redraw_msec = tv.tv_sec * 1000 + tv.tv_usec / 1000;
     uint64_t last_fps_msec = last_redraw_msec;
-    Draw();
+    Draw(ctx, term);
     int fps = 0;
     std::vector<uint64_t> time;
-    while (1) {
+    while (!ShouldExitFromCtx(ctx)) {
         gettimeofday(&tv, nullptr);
         uint64_t now_msec = tv.tv_sec * 1000 + tv.tv_usec / 1000;
 
@@ -1867,7 +1941,9 @@ void main() {
         gettimeofday(&tv, nullptr);
         now_msec = tv.tv_sec * 1000 + tv.tv_usec / 1000;
         last_redraw_msec = now_msec;
-        Draw();
+        if (Draw(ctx, term) < 0) {
+            break;
+        }
 
         gettimeofday(&tv, nullptr);
         uint64_t msec = tv.tv_sec * 1000 + tv.tv_usec / 1000;
@@ -1891,34 +1967,50 @@ void main() {
             BuildFontAtlas();
         }
     }
+
+    term->is_rendering.store(false);
+
+    return nullptr;
 }
 
 
 // on resize
-void Resize(int new_width, int new_height) {
-    pthread_mutex_lock(&term.lock);
-    buffer_width = new_width;
-    buffer_height = new_height;
+void Resize(int64_t session_id, int new_width, int new_height) {
+    terminal_context* term = GetTerminalContext(session_id);
+    if (term == nullptr) {
+        return;
+    }
 
-    ResizeTo(buffer_height / font_height, buffer_width / font_width, false);
-    pthread_mutex_unlock(&term.lock);
+    pthread_mutex_lock(&term->lock);
+    term->buffer_width = new_width;
+    term->buffer_height = new_height;
+
+    LOG_INFO("Resize: buffer=%d x %d",
+         term->buffer_width, term->buffer_height);
+
+    ResizeTo(term, term->buffer_height / font_height, term->buffer_width / font_width, false);
+    pthread_mutex_unlock(&term->lock);
 }
 
 // handle scrolling
-void ScrollBy(double offset) {
-    pthread_mutex_lock(&term.lock);
+void ScrollBy(int64_t session_id, double offset) {
+    terminal_context* term = GetTerminalContext(session_id);
+    if (term == nullptr) {
+        return;
+    }
+
+    pthread_mutex_lock(&term->lock);
     // natural scrolling
     scroll_offset -= offset;
     if (scroll_offset < 0) {
         scroll_offset = 0.0;
     }
-    pthread_mutex_unlock(&term.lock);
+    pthread_mutex_unlock(&term->lock);
 }
 
 // start render thread
-void StartRender() {
-    pthread_t render_thread;
-    pthread_create(&render_thread, NULL, RenderWorker, NULL);
+void StartRender(pthread_t *render_thread, void* ctx) {
+    pthread_create(render_thread, NULL, RenderWorker, ctx);
 }
 
 #ifdef STANDALONE

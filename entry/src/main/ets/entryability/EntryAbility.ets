@@ -1,9 +1,9 @@
-import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit';
+import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import fs from '@ohos.file.fs';
 import { abilityAccessCtrl, bundleManager, Permissions } from '@kit.AbilityKit';
-
+import { UIStyle } from '../common/Constants'
 
 const DOMAIN = 0x0000;
 
@@ -26,6 +26,25 @@ export default class EntryAbility extends UIAbility {
         return;
       }
       hilog.info(DOMAIN, 'testTag', 'Succeeded in loading the content.');
+
+      try {
+        let windowClass = windowStage.getMainWindowSync();
+
+        windowClass.setWindowDecorVisible(false)
+        windowClass.setWindowDecorHeight(UIStyle.DECOR_HEIGHT)
+
+        let colorMode : ConfigurationConstant.ColorMode = ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+
+        let style: window.DecorButtonStyle = {
+          colorMode: colorMode,
+          buttonBackgroundSize: UIStyle.DECOR_BUTTON_SIZE,
+          spacingBetweenButtons: UIStyle.DECOR_BUTTON_SPACING,
+          closeButtonRightMargin: 8,
+        };
+        windowClass.setDecorButtonStyle(style)
+      } catch (exception) {
+        console.error(`Failed to set the style of button. Cause code: ${exception.code}, message: ${exception.message}`);
+      }
     });
 
     const atManager: abilityAccessCtrl.AtManager = abilityAccessCtrl.createAtManager();

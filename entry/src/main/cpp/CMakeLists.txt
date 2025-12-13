@@ -20,6 +20,6 @@ find_library(
 add_subdirectory(freetype)
 add_subdirectory(utf8proc)
 
-add_library(entry SHARED napi_init.cpp terminal.cpp)
+add_library(entry SHARED log.cpp napi_init.cpp terminal.cpp)
 target_compile_features(entry PRIVATE cxx_std_17)
 target_link_libraries(entry PUBLIC ${EGL-lib} ${GLES-lib} libace_napi.z.so libnative_window.so libhilog_ndk.z.so freetype utf8proc)
